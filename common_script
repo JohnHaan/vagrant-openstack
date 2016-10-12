@@ -1,0 +1,63 @@
+#!/bin/bash
+echo "################################################"
+echo "# HOST File Setup"
+cat > /etc/hosts <<EOF
+127.0.0.1         localhost
+192.168.99.200    src-controller
+192.168.99.201    src-ceph01
+192.168.99.202    src-compute01
+125.141.244.39    sdcgitserver01
+EOF
+
+echo "# Base Package Update"
+sed -i 's/archive.ubuntu/kr.archive.ubuntu/' /etc/apt/sources.list
+sudo apt-get -y update
+
+echo "# Base package Install"
+sudo apt-get -y install build-essential git python-pip python-dev python3-dev libevent-dev vlan libvirt-bin bridge-utils openvswitch-switch python-libvirt ipset ntp qemu-utils
+sudo apt-get -y install python-tox libmysqlclient-dev libpq-dev libxml2-dev libxslt1-dev libvirt-dev libffi-dev libssl-dev tox libpq-dev python-libxml2 python-libxslt1
+
+echo "# python-pip upgrade"
+sudo pip install --upgrade pip
+
+echo "# NTP Install"
+sudo apt-get -y install ntp
+
+echo "# Create stack User"
+for i in {'stack','keystone','nova','glance','cinder','neutron'}
+do
+  sudo useradd -m -s /bin/bash $i
+done
+
+echo "# sudoers file create"
+cat > /etc/sudoers.d/openstack << EOF
+keystone ALL=(ALL:ALL) NOPASSWD:ALL
+glance ALL=(ALL:ALL) NOPASSWD:ALL
+nova ALL=(ALL:ALL) NOPASSWD:ALL
+cinder ALL=(ALL:ALL) NOPASSWD:ALL
+neutron ALL=(ALL:ALL) NOPASSWD:ALL
+EOF
+chmod 0440 /etc/sudoers.d/openstack
+
+echo "# ROOT use keypair insert."
+mkdir -p /root/.ssh
+cd /root/.ssh
+cp /vagrant/keypair/id_rsa id_rsa
+chmod 600 id_rsa
+cp /vagrant/keypair/id_rsa.pub id_rsa.pub
+chmod 644 id_rsa.pub
+cat id_rsa.pub >> authorized_keys
+
+echo "# UBUNTU use keypair insert."
+mkdir -p /home/ubuntu/.ssh
+    cd /home/ubuntu/.ssh
+    cp /vagrant/keypair/id_rsa id_rsa
+    chmod 600 id_rsa
+    cp /vagrant/keypair/id_rsa.pub id_rsa.pub
+    chmod 644 id_rsa.pub
+    echo "" >> authorized_keys
+    cat id_rsa.pub >> authorized_keys
+chown -R ubuntu:ubuntu /home/ubuntu
+
+echo "### Common Script Completed ###"
+echo "################################################"

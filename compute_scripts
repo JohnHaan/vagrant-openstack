@@ -1,0 +1,376 @@
+#!/bin/bash
+echo "# source environments file."
+source /vagrant/env/environment-compute.txt
+
+echo "############################################################"
+echo "### Ceph Configuration ###"
+
+echo "# Package Install "
+sudo apt -y install python-rbd ceph-common
+
+echo "# Ceph Key Configuration"
+mkdir -p /etc/ceph /opt/stack
+chown -R stack:stack /opt/stack
+cd /opt/stack
+scp -o StrictHostKeyChecking=no $VAGRANT_USER@$CEPH_HOSTNAME:/etc/ceph/ceph.conf /etc/ceph/ceph.conf
+ssh -o StrictHostKeyChecking=no $VAGRANT_USER@$CEPH_HOSTNAME 'sudo ceph auth get-or-create client.cinder' | sudo tee /etc/ceph/ceph.client.cinder.keyring
+ssh -o StrictHostKeyChecking=no $VAGRANT_USER@$CEPH_HOSTNAME 'sudo ceph auth get-key client.cinder' | tee client.cinder.key
+
+echo "# Libvirt Secret Key Configuration"
+cat > secret.xml <<EOF
+<secret ephemeral='no' private='no'>
+  <uuid>$SECRET_UUID</uuid>
+  <usage type='ceph'>
+  <name>client.cinder secret</name>
+  </usage>
+</secret>
+EOF
+
+sudo virsh secret-define --file secret.xml
+sudo virsh secret-set-value --secret $SECRET_UUID --base64 $(cat client.cinder.key)
+rm client.cinder.key secret.xml
+
+echo "# Edit ceph.conf"
+cat > ceph.conf.tmp << EOF
+[client]
+rbd cache = true
+rbd cache writethrough until flush = true
+admin socket = /var/run/ceph/guests/\$cluster-\$type.\$id.\$pid.\$cctid.asok
+log file = /var/log/qemu/qemu-guest-\$pid.log
+rbd concurrent management ops = 20
+EOF
+cat ceph.conf.tmp >> /etc/ceph/ceph.conf
+rm ceph.conf.tmp
+
+sudo mkdir -p /var/run/ceph/guests/ /var/log/qemu/
+chown libvirt-qemu:libvirtd /var/run/ceph/guests /var/log/qemu/
+
+sudo systemctl restart libvirt-bin.service
+
+echo "### Compute:Ceph Configuration Completed.###"
+echo "############################################################"
+echo "### Nova Install ###"
+
+echo "# qemu package install"
+apt -y install qemu-kvm
+
+echo "# Destroy Libvirt Default Network"
+virsh net-destroy default
+virsh net-undefine default
+
+echo "# nova included into libvirtd Group"
+sudo usermod -a -G libvirtd nova
+
+echo "# Install Nova"
+cd /opt/stack
+git clone $GIT_URL/nova.git
+cd nova
+sudo pip install -e .
+
+echo "# Generate nova.conf "
+cd /opt/stack/nova
+tox -egenconfig
+
+echo "# Nova Configuration"
+mkdir -p /var/log/nova /etc/nova /var/lib/nova/tmp /var/lib/nova/instances /var/run/nova
+cd /opt/stack/nova/etc/nova
+cp -R *.conf *.json *.ini rootwrap.d /etc/nova/.
+mv /opt/stack/nova/etc/nova/nova.conf.sample /etc/nova/.
+cp /opt/stack/nova/etc/nova/logging_sample.conf /etc/nova/logging.conf
+
+echo "# Edit nova.conf"
+cat > /etc/nova/nova.conf << EOF
+[DEFAULT]
+dhcpbridge_flagfile=/etc/nova/nova.conf
+dhcpbridge=/usr/bin/nova-dhcpbridge
+logdir=/var/log/nova
+state_path=/var/lib/nova
+lock_path=/var/lock/nova
+force_dhcp_release=True
+libvirt_use_virtio_for_bridges=True
+verbose=True
+debug=True
+ec2_private_dns_show_ip=True
+api_paste_config=/etc/nova/api-paste.ini
+enabled_apis=osapi_compute,metadata
+rpc_backend = rabbit
+auth_strategy = keystone
+my_ip = $MY_IP
+use_neutron = True
+firewall_driver = nova.virt.firewall.NoopFirewallDriver
+
+[api_database]
+connection = mysql+pymysql://nova:$SERVICE_PASS@$MGMT_HOSTNAME/nova_api
+
+[database]
+connection = mysql+pymysql://nova:$SERVICE_PASS@$MGMT_HOSTNAME/nova
+
+[vnc]
+enabled = True
+vncserver_listen = 0.0.0.0
+vncserver_proxyclient_address = $MY_IP
+novncproxy_base_url = http://$MGMT_IP:6080/vnc_auto.html
+
+[glance]
+api_servers = http://$MGMT_HOSTNAME:9292
+
+[neutron]
+url = http://$MGMT_HOSTNAME:9696
+auth_url = http://$MGMT_HOSTNAME:35357
+auth_type = password
+project_domain_name = default
+user_domain_name = default
+region_name = RegionOne
+project_name = service
+username = neutron
+password = $SERVICE_PASS
+
+service_metadata_proxy = True
+metadata_proxy_shared_secret = $SERVICE_PASS
+
+[oslo_concurrency]
+lock_path = /var/lib/nova/tmp
+
+[oslo_messaging_rabbit]
+rabbit_host = $MGMT_HOSTNAME
+rabbit_userid = openstack
+rabbit_password = $RABBIT_PASS
+
+[keystone_authtoken]
+auth_uri = http://$MGMT_HOSTNAME:5000
+auth_url = http://$MGMT_HOSTNAME:35357
+memcached_servers = $MGMT_HOSTNAME:11211
+auth_type = password
+project_domain_name = default
+user_domain_name = default
+project_name = service
+username = nova
+password = $SERVICE_PASS
+EOF
+
+echo "# Edit nova-compute.conf"
+cat > /etc/nova/nova-compute.conf << EOF
+[DEFAULT]
+compute_driver = libvirt.LibvirtDriver
+
+[libvirt]
+virt_type = qemu
+images_type = rbd
+images_rbd_pool = vms
+images_rbd_ceph_conf = /etc/ceph/ceph.conf
+rbd_user = cinder
+rbd_secret_uuid = 457eb676-33da-42ec-9a8c-9293d545c337
+disk_cachemodes="network=writeback"
+inject_password = false
+inject_key = false
+inject_partition = -2
+hw_disk_discard = unmap
+EOF
+
+echo "# Chown of Nova Directories"
+for i in {'/etc/nova','/var/log/nova','/var/lib/nova','/var/run/nova'}
+do
+    chown -R nova:nova $i
+done
+chown root:root /etc/nova/rootwrap.conf
+chown -R root.root /etc/nova/rootwrap.d
+
+echo "# Create nova-compute Init Script"
+cat > /lib/systemd/system/nova-compute.service << EOF
+[Unit]
+Description=OpenStack Nova Compute Server
+After=syslog.target network.target
+
+[Service]
+Environment=LIBGUESTFS_ATTACH_METHOD=appliance
+Type=notify
+NotifyAccess=all
+TimeoutStartSec=0
+Restart=always
+User=nova
+ExecStart=/usr/local/bin/nova-compute
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "# Start nova-compute"
+systemctl enable nova-compute.service
+systemctl start nova-compute.service
+
+echo "### Compute:Nova Configuration Completed.###"
+echo "############################################################"
+echo "### Neutron Install ###"
+
+echo "# Install Neutron"
+cd /opt/stack
+git clone http://git.openstack.org/openstack/neutron.git -b stable/mitaka
+cd neutron
+sudo pip install -e .
+
+echo "# Generate neutron.conf"
+cd /opt/stack/neutron
+tox -e genconfig
+
+echo "# Neutron Configuration"
+mkdir -p /var/log/neutron /etc/neutron/plugins/ml2 /var/lib/neutron /var/run/neutron
+cd /opt/stack/neutron/etc
+cp *.ini *.conf *.json /etc/neutron/.
+cp -R /opt/stack/neutron/etc/neutron/rootwrap.d /etc/neutron/.
+cp /opt/stack/neutron/etc/neutron.conf.sample /etc/neutron/.
+cp /opt/stack/neutron/etc/neutron/plugins/ml2/ml2_conf.ini.sample /etc/neutron/plugins/ml2/.
+cp /opt/stack/neutron/etc/neutron/plugins/ml2/openvswitch_agent.ini.sample /etc/neutron/plugins/ml2/.
+
+echo "# Edit neutron.conf "
+cat > /etc/neutron/neutron.conf << EOF
+[DEFAULT]
+verbose = true
+core_plugin = ml2
+service_plugins = router
+allow_overlapping_ips = true
+rpc_backend = rabbit
+auth_strategy = keystone
+state_path = /var/lib/neutron
+log_dir = /var/log/neutron
+
+notify_nova_on_port_status_changes = True
+notify_nova_on_port_data_changes = True
+
+[agent]
+root_helper = sudo /usr/local/bin/neutron-rootwrap /etc/neutron/rootwrap.conf
+
+[database]
+connection = mysql+pymysql://neutron:$SERVICE_PASS@$MGMT_HOSTNAME/neutron
+
+[oslo_messaging_rabbit]
+rabbit_host = $MGMT_HOSTNAME
+rabbit_userid = openstack
+rabbit_password = $RABBIT_PASS
+
+[oslo_concurrency]
+lock_path = /var/lib/neutron/lock
+
+[keystone_authtoken]
+auth_uri = http://$MGMT_HOSTNAME:5000
+auth_url = http://$MGMT_HOSTNAME:35357
+memcached_servers = $MGMT_HOSTNAME:11211
+auth_type = password
+project_domain_name = default
+user_domain_name = default
+project_name = service
+username = neutron
+password = $SERVICE_PASS
+
+[nova]
+auth_url = http://$MGMT_HOSTNAME:35357
+auth_type = password
+project_domain_name = default
+user_domain_name = default
+region_name = RegionOne
+project_name = service
+username = nova
+password = $SERVICE_PASS
+EOF
+
+echo "# Configure ml2_conf.ini"
+cat > /etc/neutron/plugins/ml2/ml2_conf.ini << EOF
+[ml2]
+type_drivers = flat,vlan,vxlan
+tenant_network_types = vxlan
+mechanism_drivers = openvswitch,l2population
+extension_drivers = port_security
+
+[ml2_type_flat]
+flat_networks = external
+
+[ml2_type_vxlan]
+vni_ranges = 65537:69999
+
+[securitygroup]
+firewall_driver = iptables_hybrid
+enable_security_group = true
+enable_ipset = true
+EOF
+
+echo "# Configure openvswitch agent"
+cat > /etc/neutron/plugins/ml2/openvswitch_agent.ini << EOF
+[DEFAULT]
+verbose = true
+debug = true
+log_dir = /var/log/neutron
+
+[ovs]
+local_ip = $TUNNEL_IP
+integration_bridge = br-int
+bridge_mappings = external:br-ex
+datapath_type = system
+tunnel_bridge = br-tun
+
+[agent]
+tunnel_types = vxlan
+l2_population = true
+
+[securitygroup]
+firewall_driver = iptables_hybrid
+enable_security_group = true
+enable_ipset = true
+EOF
+
+echo "# Chown of Neutron Directories"
+for i in {'/var/log/neutron','/etc/neutron','/var/lib/neutron','/var/run/neutron'}
+do
+    chown -R neutron:neutron $i
+done
+chown root.root /etc/neutron/rootwrap.conf
+chown -R root.root /etc/neutron/rootwrap.d
+
+echo "# Create neutron-openvswitch-agent init script"
+cat > /lib/systemd/system/neutron-openvswitch-agent.service << EOF
+[Unit]
+Description=OpenStack Neutron Open vSwitch Agent
+After=syslog.target network.target network.service
+PartOf=network.service
+[Service]
+Type=simple
+User=neutron
+ExecStart=/usr/local/bin/neutron-openvswitch-agent \
+                 --config-file /etc/neutron/neutron.conf \
+                 --config-file /etc/neutron/plugins/ml2/ml2_conf.ini \
+                 --config-file /etc/neutron/plugins/ml2/openvswitch_agent.ini \
+                 --log-file /var/log/neutron/neutron-openvswitch-agent.log
+PrivateTmp=true
+KillMode=process
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "# Restart ovs service"
+systemctl restart openvswitch-switch.service
+
+echo "# create br-ex bridge"
+ovs-vsctl add-br br-ex
+
+echo "# create br-ex bridge"
+ovs-vsctl add-br br-ex
+ovs-vsctl add-port br-ex $EXTERNAL_INTERFACE
+
+echo "# Start neutron-openvswitch-agent service"
+systemctl enable neutron-openvswitch-agent.service
+systemctl start neutron-openvswitch-agent
+
+echo "### Compute:Neutron Configuration Completed.###"
+echo "############################################################"
+echo "### Live Migration Configuration.###"
+
+echo "# Edit libvirt damon Config "
+sed -i 's/#listen_tls = 0/listen_tls = 0/' /etc/libvirt/libvirtd.conf
+sed -i 's/#listen_tcp = 1/listen_tcp = 1/' /etc/libvirt/libvirtd.conf
+sed -i 's/#auth_tcp = "sasl"/auth_tcp = "none"/' /etc/libvirt/libvirtd.conf
+sed -i 's/#libvirtd_opts=""/libvirtd_opts="-d -l"/' /etc/default/libvirt-bin
+
+echo "# Restart Libvirt Service"
+systemctl restart libvirt-bin.service
+
+echo "### Compute:live-migration configuration Completed.###"
+echo "### Installation Completed.###"
+echo "############################################################"

@@ -1,0 +1,22 @@
+## source this file in controller
+export VAGRANT_USER="ubuntu"
+export MGMT_HOSTNAME="src-controller"
+export MGMT_IP="192.168.99.200"
+export CEPH_HOSTNAME="src-ceph01"
+export HOSTNAME=`hostname -s`
+export MY_IP="192.168.99.200"
+export TUNNEL_IP="192.168.99.200"
+export EXTERNAL_INTERFACE="enp0s9"
+
+export MYSQL_PASS="password"
+export SERVICE_PASS="password"
+export RABBIT_PASS="password"
+export ADMIN_PASS="password"
+export DEMO_PASS="password"
+
+export OS_TOKEN=`openssl rand -hex 10`
+export OS_URL=http://$MGMT_HOSTNAME:35357/v3
+export OS_IDENTITY_API_VERSION=3
+
+export GIT_URL="http://sdcgitserver01/cloudtechteam/"  ###if upstream - http://git.openstack.org/openstack/
+export DJANGO_SETTINGS_MODULE=openstack_dashboard.settings

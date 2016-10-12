@@ -1,0 +1,1506 @@
+#!/bin/bash
+echo "# source environments file."
+source /vagrant/env/environment-controller.txt
+
+echo "############################################################"
+echo "### Ceph Install ###"
+
+echo "# Install ceph-deploy"
+wget -q -O- 'https://download.ceph.com/keys/release.asc' | sudo apt-key add -
+echo deb http://download.ceph.com/debian-jewel/ xenial main | sudo tee /etc/apt/sources.list.d/ceph.list
+sudo apt-get -y update
+sudo apt-get -y install python-rbd ceph-common ceph-deploy
+
+echo "# Edit ssh config"
+cat > /root/.ssh/config << EOF
+Host $CEPH_HOSTNAME
+    Hostname $CEPH_HOSTNAME
+    User $VAGRANT_USER
+EOF
+
+echo "# Install ceph into the ceph node"
+mkdir -p /opt/ceph-cluster
+cd /opt/ceph-cluster
+ssh -o StrictHostKeyChecking=no $CEPH_HOSTNAME 'date'
+ceph-deploy new $CEPH_HOSTNAME --no-ssh-copykey
+
+echo "# Edit ceph.conf"
+echo "osd pool default size = 2" >> /opt/ceph-cluster/ceph.conf
+echo "osd pool default min size = 1" >> /opt/ceph-cluster/ceph.conf
+
+echo "# ceph package install"
+ceph-deploy install --release jewel $CEPH_HOSTNAME
+
+echo "# initialize monitor"
+ceph-deploy mon create-initial
+
+echo "# osd disk zap"
+ceph-deploy disk zap $CEPH_HOSTNAME:sdc $CEPH_HOSTNAME:sdd $CEPH_HOSTNAME:sde
+
+echo "# osd prepare"
+ceph-deploy osd prepare $CEPH_HOSTNAME:/dev/sdc $CEPH_HOSTNAME:/dev/sdd $CEPH_HOSTNAME:/dev/sde
+
+echo "# osd activate"
+ceph-deploy osd activate $CEPH_HOSTNAME:/dev/sdc1 $CEPH_HOSTNAME:/dev/sdd1 $CEPH_HOSTNAME:/dev/sde1
+
+echo "# copy admin keyring"
+ceph-deploy admin $CEPH_HOSTNAME
+
+echo "# give read auth to ceph node"
+ssh -o StrictHostKeyChecking=no $VAGRANT_USER@$CEPH_HOSTNAME 'sudo chmod +r /etc/ceph/ceph.client.admin.keyring'
+
+echo "# Edit crush map"
+ssh -o StrictHostKeyChecking=no $VAGRANT_USER@$CEPH_HOSTNAME "sudo ceph osd getcrushmap -o orimap.c"
+ssh -o StrictHostKeyChecking=no $VAGRANT_USER@$CEPH_HOSTNAME "crushtool -d orimap.c -o crushmap.txt"
+ssh -o StrictHostKeyChecking=no $VAGRANT_USER@$CEPH_HOSTNAME "sed -i 's/step chooseleaf firstn 0 type host/step chooseleaf firstn 0 type osd/' crushmap.txt"
+ssh -o StrictHostKeyChecking=no $VAGRANT_USER@$CEPH_HOSTNAME "crushtool -c crushmap.txt -o modify.c"
+ssh -o StrictHostKeyChecking=no $VAGRANT_USER@$CEPH_HOSTNAME "sudo ceph osd setcrushmap -i modify.c"
+
+echo "# Pool create"
+ssh -o StrictHostKeyChecking=no $VAGRANT_USER@$CEPH_HOSTNAME "sudo ceph osd pool create volumes 64"
+ssh -o StrictHostKeyChecking=no $VAGRANT_USER@$CEPH_HOSTNAME "sudo ceph osd pool create images 64"
+ssh -o StrictHostKeyChecking=no $VAGRANT_USER@$CEPH_HOSTNAME "sudo ceph osd pool create backups 64"
+ssh -o StrictHostKeyChecking=no $VAGRANT_USER@$CEPH_HOSTNAME "sudo ceph osd pool create vms 64"
+
+echo "# copy of ceph.conf"
+mkdir -p /etc/ceph
+scp -o StrictHostKeyChecking=no $VAGRANT_USER@$CEPH_HOSTNAME:/etc/ceph/ceph.conf /etc/ceph/ceph.conf
+
+echo "# nova, cinder, glance auth create"
+ssh -o StrictHostKeyChecking=no $VAGRANT_USER@$CEPH_HOSTNAME "ceph auth get-or-create client.cinder mon 'allow r' osd 'allow class-read object_prefix rbd_children, allow rwx pool=volumes, allow rwx pool=vms, allow rx pool=images'"
+ssh -o StrictHostKeyChecking=no $VAGRANT_USER@$CEPH_HOSTNAME "ceph auth get-or-create client.glance mon 'allow r' osd 'allow class-read object_prefix rbd_children, allow rwx pool=images'"
+ssh -o StrictHostKeyChecking=no $VAGRANT_USER@$CEPH_HOSTNAME "ceph auth get-or-create client.cinder-backup mon 'allow r' osd 'allow class-read object_prefix rbd_children, allow rwx pool=backups'"
+
+ssh -o StrictHostKeyChecking=no $VAGRANT_USER@$CEPH_HOSTNAME "ceph auth get-or-create client.glance" | sudo tee /etc/ceph/ceph.client.glance.keyring
+sudo chown glance:glance /etc/ceph/ceph.client.glance.keyring
+
+ssh -o StrictHostKeyChecking=no $VAGRANT_USER@$CEPH_HOSTNAME "ceph auth get-or-create client.cinder" | sudo tee /etc/ceph/ceph.client.cinder.keyring
+sudo chown cinder:cinder /etc/ceph/ceph.client.cinder.keyring
+ssh -o StrictHostKeyChecking=no $VAGRANT_USER@$CEPH_HOSTNAME "ceph auth get-or-create client.cinder-backup" | sudo tee /etc/ceph/ceph.client.cinder-backup.keyring
+sudo chown cinder:cinder /etc/ceph/ceph.client.cinder-backup.keyring
+
+echo "###Controller:Ceph Installation Completed.###"
+echo "#################################################################"
+echo "### MySQL Install ###"
+
+echo "# Preseed mysql packages"
+echo mysql-server mysql-server/root_password select $MYSQL_PASS | sudo debconf-set-selections
+echo mysql-server mysql-server/root_password_again select $MYSQL_PASS | sudo debconf-set-selections
+
+echo "# Install MariaDB"
+sudo apt-get -y install mariadb-server python-pymysql
+
+echo "# Change MySQL Configuration"
+mv /etc/mysql/my.cnf /etc/mysql/my.cnf.bak
+cat > /etc/mysql/my.cnf << EOF
+[client]
+port            = 3306
+socket          = /var/run/mysqld/mysqld.sock
+
+[mysqld_safe]
+socket          = /var/run/mysqld/mysqld.sock
+nice            = 0
+
+[mysqld]
+user            = mysql
+pid-file        = /var/run/mysqld/mysqld.pid
+socket          = /var/run/mysqld/mysqld.sock
+port            = 3306
+basedir         = /usr
+datadir         = /var/lib/mysql
+tmpdir          = /tmp
+lc-messages-dir = /usr/share/mysql
+skip-external-locking
+default-storage-engine = innodb
+innodb_file_per_table
+collation-server = utf8_general_ci
+character-set-server = utf8
+max_connections        = 1000
+
+bind-address            = 0.0.0.0
+
+key_buffer              = 16M
+max_allowed_packet      = 16M
+thread_stack            = 192K
+thread_cache_size       = 8
+myisam-recover         = BACKUP
+query_cache_limit       = 1M
+query_cache_size        = 16M
+
+log_error = /var/log/mysql/error.log
+
+expire_logs_days        = 10
+max_binlog_size         = 100M
+
+[mysqldump]
+quick
+quote-names
+max_allowed_packet      = 16M
+
+[isamchk]
+key_buffer              = 16M
+EOF
+
+echo "# Restart MySQL Service"
+systemctl restart mysql.service
+
+echo "# Create OpenStack Databases"
+for i in {'keystone','glance','nova','neutron','cinder'}
+do
+    mysql -uroot -p$MYSQL_PASS -e "CREATE DATABASE $i;"
+    mysql -uroot -p$MYSQL_PASS -e "GRANT ALL PRIVILEGES ON $i.* TO '$i'@'%' IDENTIFIED BY '$SERVICE_PASS'"
+    mysql -uroot -p$MYSQL_PASS -e "GRANT ALL PRIVILEGES ON $i.* TO '$i'@'localhost' IDENTIFIED BY '$SERVICE_PASS'"
+done
+mysql -uroot -p$MYSQL_PASS -e "CREATE DATABASE nova_api;"
+mysql -uroot -p$MYSQL_PASS -e "GRANT ALL PRIVILEGES ON nova_api.* TO 'nova'@'%' IDENTIFIED BY '$SERVICE_PASS'"
+mysql -uroot -p$MYSQL_PASS -e "GRANT ALL PRIVILEGES ON nova_api.* TO 'nova'@'localhost' IDENTIFIED BY '$SERVICE_PASS'"
+
+echo "Controller:MariaDB Installation Completed."
+echo "#################################################################"
+echo "### RabbitMQ Install ###"
+
+sudo apt-get -y install rabbitmq-server
+rabbitmqctl add_user openstack $RABBIT_PASS
+rabbitmqctl set_permissions openstack ".*" ".*" ".*"
+
+echo "Controller:RabbitMQ Installation Completed."
+echo "#################################################################"
+echo "### Memcached Install ###"
+
+sudo apt-get -y install memcached python-memcache
+sed -i 's/-l 127.0.0.1/-l '"$MGMT_IP"'/' /etc/memcached.conf
+
+systemctl restart memcached.service
+
+echo "Controller:Memcached Installation Completed."
+echo "#################################################################"
+echo "### Keystone Install ###"
+
+echo "# Install apache2"
+sudo apt-get -y install apache2 libapache2-mod-wsgi
+
+echo "# keystone Source Install"
+mkdir -p /opt/stack
+chown -R stack:stack /opt/stack
+cd /opt/stack
+git clone http://git.openstack.org/openstack/keystone.git -b stable/mitaka
+cd keystone
+sudo pip install -e .
+cd ..
+
+echo "# OpenStack Client Install"
+git clone http://git.openstack.org/openstack/python-openstackclient.git
+cd python-openstackclient
+sudo pip install -e .
+cd ..
+
+echo "# Keystone Configuration"
+sudo mkdir -p /var/log/keystone
+sudo chown -R keystone:keystone /var/log/keystone
+mkdir -p /etc/keystone/fernet-keys
+cp /opt/stack/keystone/etc/* /etc/keystone/.
+chown -R keystone:keystone /etc/keystone
+
+cat > /etc/keystone/keystone.conf << EOF
+[DEFAULT]
+admin_token = $OS_TOKEN
+verbose = false
+log_dir = /var/log/keystone
+
+[database]
+connection = mysql+pymysql://keystone:$SERVICE_PASS@$MGMT_HOSTNAME/keystone
+
+[oslo_messaging_rabbit]
+rabbit_host = $MGMT_HOSTNAME
+rabbit_userid = openstack
+rabbit_password = $RABBIT_PASS
+
+[token]
+provider = fernet
+
+[extra_headers]
+Distribution = Ubuntu
+EOF
+
+echo "# Keystone DB sync"
+su -s /bin/sh -c "keystone-manage db_sync" keystone
+
+echo "# Keystone fernet setup"
+keystone-manage fernet_setup --keystone-user keystone --keystone-group keystone
+
+echo "# Apache2 Configuration"
+echo 'ServerName '$MGMT_HOSTNAME >> /etc/apache2/apache2.conf
+
+echo "# keystone wsgi module setup"
+cat > /etc/apache2/sites-available/wsgi-keystone.conf << EOF
+Listen 5000
+Listen 35357
+
+<VirtualHost *:5000>
+    WSGIDaemonProcess keystone-public processes=5 threads=1 user=keystone group=keystone display-name=%{GROUP}
+    WSGIProcessGroup keystone-public
+    WSGIScriptAlias / /usr/local/bin/keystone-wsgi-public
+    WSGIApplicationGroup %{GLOBAL}
+    WSGIPassAuthorization On
+    ErrorLogFormat "%{cu}t %M"
+    ErrorLog /var/log/apache2/keystone.log
+    CustomLog /var/log/apache2/keystone_access.log combined
+
+    <Directory /usr/local/bin>
+        Require all granted
+    </Directory>
+</VirtualHost>
+
+<VirtualHost *:35357>
+    WSGIDaemonProcess keystone-admin processes=5 threads=1 user=keystone group=keystone display-name=%{GROUP}
+    WSGIProcessGroup keystone-admin
+    WSGIScriptAlias / /usr/local/bin/keystone-wsgi-admin
+    WSGIApplicationGroup %{GLOBAL}
+    WSGIPassAuthorization On
+    ErrorLogFormat "%{cu}t %M"
+    ErrorLog /var/log/apache2/keystone.log
+    CustomLog /var/log/apache2/keystone_access.log combined
+
+    <Directory /usr/local/bin>
+        Require all granted
+    </Directory>
+</VirtualHost>
+EOF
+
+ln -s /etc/apache2/sites-available/wsgi-keystone.conf /etc/apache2/sites-enabled
+systemctl restart apache2.service
+
+echo "# keystone service create"
+openstack service create --name keystone --description "OpenStack Identity" identity
+openstack service create --name glance --description "OpenStack Image" image
+openstack service create --name nova --description "OpenStack Compute" compute
+openstack service create --name neutron --description "OpenStack Networking" network
+openstack service create --name cinder --description "OpenStack Block Storage" volume
+openstack service create --name cinderv2 --description "OpenStack Block Storage" volumev2
+
+echo "# keystone endpoint create"
+openstack endpoint create --region RegionOne identity public http://$MGMT_HOSTNAME:5000/v3
+openstack endpoint create --region RegionOne identity internal http://$MGMT_HOSTNAME:5000/v3
+openstack endpoint create --region RegionOne identity admin http://$MGMT_HOSTNAME:35357/v3
+openstack endpoint create --region RegionOne image public http://$MGMT_HOSTNAME:9292
+openstack endpoint create --region RegionOne image internal http://$MGMT_HOSTNAME:9292
+openstack endpoint create --region RegionOne image admin http://$MGMT_HOSTNAME:9292
+openstack endpoint create --region RegionOne compute public http://$MGMT_HOSTNAME:8774/v2.1/%\(tenant_id\)s
+openstack endpoint create --region RegionOne compute internal http://$MGMT_HOSTNAME:8774/v2.1/%\(tenant_id\)s
+openstack endpoint create --region RegionOne compute admin http://$MGMT_HOSTNAME:8774/v2.1/%\(tenant_id\)s
+openstack endpoint create --region RegionOne network public http://$MGMT_HOSTNAME:9696
+openstack endpoint create --region RegionOne network internal http://$MGMT_HOSTNAME:9696
+openstack endpoint create --region RegionOne network admin http://$MGMT_HOSTNAME:9696
+openstack endpoint create --region RegionOne volume public http://$MGMT_HOSTNAME:8776/v1/%\(tenant_id\)s
+openstack endpoint create --region RegionOne volume internal http://$MGMT_HOSTNAME:8776/v1/%\(tenant_id\)s
+openstack endpoint create --region RegionOne volume admin http://$MGMT_HOSTNAME:8776/v1/%\(tenant_id\)s
+openstack endpoint create --region RegionOne volumev2 public http://$MGMT_HOSTNAME:8776/v2/%\(tenant_id\)s
+openstack endpoint create --region RegionOne volumev2 internal http://$MGMT_HOSTNAME:8776/v2/%\(tenant_id\)s
+openstack endpoint create --region RegionOne volumev2 admin http://$MGMT_HOSTNAME:8776/v2/%\(tenant_id\)s
+
+echo "# Keystone Domain Create"
+openstack domain create --description "Default Domain" default
+
+echo "# Keystone Project Create"
+openstack project create --domain default --description "Admin Project" admin
+openstack project create --domain default --description "Service Project" service
+openstack project create --domain default --description "Demo Project" demo
+
+echo "# Keystone User Create"
+openstack user create --domain default --password $ADMIN_PASS admin
+openstack user create --domain default --password $DEMO_PASS demo
+for i in {'glance','nova','neutron','cinder'}
+do
+    openstack user create --domain default --password $SERVICE_PASS $i
+done
+
+echo "# Keystone Role"
+openstack role create admin
+openstack role create user
+openstack role add --project admin --user admin admin
+openstack role add --project demo --user demo user
+for i in {'glance','nova','neutron','cinder'}
+do
+    openstack role add --project service --user $i admin
+done
+
+echo "# Keystone auth file create"
+export OS_TOKEN=""
+export OS_URL=""
+
+cat > /root/admin-openrc << EOF
+export OS_PROJECT_DOMAIN_NAME=default
+export OS_USER_DOMAIN_NAME=default
+export OS_PROJECT_NAME=admin
+export OS_USERNAME=admin
+export OS_PASSWORD=$ADMIN_PASS
+export OS_AUTH_URL=http://$MGMT_HOSTNAME:35357/v3
+export OS_IDENTITY_API_VERSION=3
+export OS_IMAGE_API_VERSION=2
+EOF
+
+cat > /root/demo-openrc << EOF
+export OS_PROJECT_DOMAIN_NAME=default
+export OS_USER_DOMAIN_NAME=default
+export OS_PROJECT_NAME=demo
+export OS_USERNAME=demo
+export OS_PASSWORD=$DEMO_PASS
+export OS_AUTH_URL=http://$MGMT_HOSTNAME:5000/v3
+export OS_IDENTITY_API_VERSION=3
+export OS_IMAGE_API_VERSION=2
+EOF
+
+echo "Controller:Keystone Installation Completed."
+#################################################################
+### Glance Install
+
+echo "# glance source install"
+cd /opt/stack
+git clone http://git.openstack.org/openstack/glance.git -b stable/mitaka
+cd glance
+sudo pip install -e .
+
+echo "# glance configuration"
+mkdir -p /var/log/glance /var/lib/glance/images /var/lib/glance/image-cache
+chown -R glance:glance /var/log/glance
+mkdir -p /etc/glance
+cp /opt/stack/glance/etc/glance-* /etc/glance/.
+cp /opt/stack/glance/etc/*.json /etc/glance/.
+cp -R /opt/stack/glance/etc/metadefs /etc/glance/.
+chown -R glance:glance /etc/glance
+chown -R glance:glance /var/lib/glance
+
+echo "# Edit glance-api.conf"
+cat > /etc/glance/glance-api.conf << EOF
+[DEFAULT]
+verbose = true
+debug = true
+
+image_cache_dir = /var/lib/glance/image-cache/
+log_file = glance-api.log
+log_dir = /var/log/glance
+
+[database]
+connection = mysql+pymysql://glance:$SERVICE_PASS@$HOSTNAME/glance
+backend = sqlalchemy
+
+[glance_store]
+stores = rbd
+default_store = rbd
+rbd_store_chunk_size = 4
+rbd_store_pool = images
+rbd_store_user = glance
+rbd_store_ceph_conf = /etc/ceph/ceph.conf
+
+
+[image_format]
+disk_formats = ami,ari,aki,vhd,vmdk,raw,qcow2,vdi,iso,root-tar
+
+[keystone_authtoken]
+auth_uri = http://$HOSTNAME:5000
+auth_url = http://$HOSTNAME:35357
+memcached_servers = $HOSTNAME:11211
+auth_type = password
+project_domain_name = default
+user_domain_name = default
+project_name = service
+username = glance
+password = $SERVICE_PASS
+
+[oslo_messaging_rabbit]
+rabbit_host = $HOSTNAME
+rabbit_userid = openstack
+rabbit_password = $RABBIT_PASS
+
+[paste_deploy]
+flavor = keystone
+EOF
+
+# glance-registry configuration
+cat > /etc/glance/glance-registry.conf << EOF
+[DEFAULT]
+debug = true
+verbose = true
+log_file = glance-registry.log
+log_dir = /var/log/glance
+
+[database]
+connection = mysql+pymysql://glance:$SERVICE_PASS@$HOSTNAME/glance
+backend = sqlalchemy
+
+[keystone_authtoken]
+
+auth_uri = http://$HOSTNAME:5000
+auth_url = http://$HOSTNAME:35357
+memcached_servers = $HOSTNAME:11211
+auth_type = password
+project_domain_name = default
+user_domain_name = default
+project_name = service
+username = glance
+password = $SERVICE_PASS
+
+[paste_deploy]
+flavor = keystone
+EOF
+
+# glance db sync
+su -s /bin/sh -c "glance-manage db_sync" glance
+
+# glance-api init script
+cat > /lib/systemd/system/glance-api.service << EOF
+[Unit]
+Description=OpenStack Image Service (code-named Glance) API server
+After=syslog.target network.target
+[Service]
+Type=simple
+User=glance
+ExecStart=/usr/local/bin/glance-api
+PrivateTmp=true
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl enable glance-api.service
+systemctl start glance-api
+
+# glance-registry init script
+cat > /lib/systemd/system/glance-registry.service << EOF
+[Unit]
+Description=OpenStack Image Service (code-named Glance) Registry server
+After=syslog.target network.target
+[Service]
+Type=simple
+User=glance
+ExecStart=/usr/local/bin/glance-registry
+PrivateTmp=true
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl enable glance-registry.service
+systemctl start glance-registry
+
+# RAW image upload for image direct url
+cd /opt/stack
+wget http://download.cirros-cloud.net/0.3.4/cirros-0.3.4-x86_64-disk.img
+sudo qemu-img convert -f qcow2 -O raw cirros-0.3.4-x86_64-disk.img cirros-0.3.4-x86_64-disk.raw
+sudo chown stack:stack cirros-0.3.4-x86_64-disk.raw
+openstack image create --file /opt/stack/cirros-0.3.4-x86_64-disk.raw --disk-format raw --container-format bare --public cirros-0.3.4
+#wget https://uec-images.ubuntu.com/releases/14.04/release/ubuntu-14.04-server-cloudimg-amd64-disk1.img
+#sudo qemu-img convert -f qcow2 -O raw ubuntu-14.04-server-cloudimg-amd64-disk1.img ubuntu-14.04-server-cloudimg-amd64-disk1.raw
+#sudo chown stack:stack ubuntu-14.04-server-cloudimg-amd64-disk1.raw
+#openstack image create --file ubuntu-14.04-server-cloudimg-amd64-disk1.raw --disk-format raw --container-format bare --public ubuntu-14.04
+
+echo "Controller:Glance Installation Completed."
+echo "#################################################################"
+echo "### Nova Install"
+cd /opt/stack
+
+echo "# Nova Client Install"
+git clone $GIT_URL/python-novaclient.git
+cd python-novaclient
+sudo pip install -e .
+cd ..
+
+echo "# nova install"
+git clone $GIT_URL/nova.git
+cd nova
+sudo pip install -e .
+
+echo "# nova configuration"
+tox -egenconfig
+mkdir -p /etc/nova /var/log/nova /var/lib/nova/tmp /var/run/nova /usr/share/novnc
+cd /opt/stack/nova/etc/nova
+cp -R *.conf *.json *.ini rootwrap.d /etc/nova/.
+mv /opt/stack/nova/etc/nova/nova.conf.sample /etc/nova/nova.conf.sample
+cp /opt/stack/nova/etc/nova/logging_sample.conf /etc/nova/logging.conf
+
+cat > /etc/nova/nova.conf << EOF
+[DEFAULT]
+dhcpbridge_flagfile=/etc/nova/nova.conf
+dhcpbridge=/usr/bin/nova-dhcpbridge
+logdir=/var/log/nova
+state_path=/var/lib/nova
+lock_path=/var/lock/nova
+force_dhcp_release=True
+libvirt_use_virtio_for_bridges=True
+debug=True
+verbose=True
+ec2_private_dns_show_ip=True
+api_paste_config=/etc/nova/api-paste.ini
+enabled_apis=osapi_compute,metadata
+rpc_backend = rabbit
+auth_strategy = keystone
+my_ip = $MGMT_IP
+use_neutron = True
+firewall_driver = nova.virt.firewall.NoopFirewallDriver
+
+[api_database]
+connection = mysql+pymysql://nova:$SERVICE_PASS@$HOSTNAME/nova_api
+
+[database]
+connection = mysql+pymysql://nova:$SERVICE_PASS@$HOSTNAME/nova
+
+[vnc]
+vncserver_listen = $MGMT_IP
+vncserver_proxyclient_address = $MGMT_IP
+
+[glance]
+api_servers = http://$HOSTNAME:9292
+
+[cinder]
+os_region_name = RegionOne
+
+[neutron]
+url = http://$HOSTNAME:9696
+auth_url = http://$HOSTNAME:35357
+auth_type = password
+project_domain_name = default
+user_domain_name = default
+region_name = RegionOne
+project_name = service
+username = neutron
+password = $SERVICE_PASS
+
+service_metadata_proxy = True
+metadata_proxy_shared_secret = $SERVICE_PASS
+
+[oslo_concurrency]
+lock_path = /var/lib/nova/tmp
+
+[oslo_messaging_rabbit]
+rabbit_host = $HOSTNAME
+rabbit_userid = openstack
+rabbit_password = $RABBIT_PASS
+
+[keystone_authtoken]
+auth_uri = http://$HOSTNAME:5000
+auth_url = http://$HOSTNAME:35357
+memcached_servers = $HOSTNAME:11211
+auth_type = password
+project_domain_name = default
+user_domain_name = default
+project_name = service
+username = nova
+password = $SERVICE_PASS
+EOF
+
+echo "# chown of nova direcories"
+for i in {'/etc/nova','/var/log/nova','/var/lib/nova','/var/run/nova','/usr/share/novnc'}
+do
+    chown -R nova:nova $i
+done
+chown root:root /etc/nova/rootwrap.conf
+chown -R root:root /etc/nova/rootwrap.d
+
+
+echo "# nova db sync"
+su -s /bin/sh -c "nova-manage api_db sync" nova
+su -s /bin/sh -c "nova-manage db sync" nova
+
+echo "# nova-api init script create"
+cat > /lib/systemd/system/nova-api.service << EOF
+[Unit]
+Description=OpenStack Nova API Server
+After=syslog.target network.target
+[Service]
+Type=notify
+NotifyAccess=all
+TimeoutStartSec=0
+Restart=always
+User=nova
+ExecStart=/usr/local/bin/nova-api
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "# nova-consoleauth init script create"
+cat > /lib/systemd/system/nova-consoleauth.service << EOF
+[Unit]
+Description=OpenStack Nova VNC console auth Server
+After=syslog.target network.target
+[Service]
+Type=notify
+NotifyAccess=all
+TimeoutStartSec=0
+Restart=always
+User=nova
+ExecStart=/usr/local/bin/nova-consoleauth
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "# nova-scheduler init script create"
+cat > /lib/systemd/system/nova-scheduler.service << EOF
+[Unit]
+Description=OpenStack Nova Scheduler Server
+After=syslog.target network.target
+[Service]
+Type=notify
+NotifyAccess=all
+TimeoutStartSec=0
+Restart=always
+User=nova
+ExecStart=/usr/local/bin/nova-scheduler
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "# nova-conductor init script create"
+cat > /lib/systemd/system/nova-conductor.service << EOF
+[Unit]
+Description=OpenStack Nova Conductor Server
+After=syslog.target network.target
+[Service]
+Type=notify
+NotifyAccess=all
+TimeoutStartSec=0
+Restart=always
+User=nova
+ExecStart=/usr/local/bin/nova-conductor
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "# nova-novncproxy init script create"
+cat > /lib/systemd/system/nova-novncproxy.service << EOF
+[Unit]
+Description=OpenStack Nova NoVNC Proxy Server
+After=syslog.target network.target
+[Service]
+Type=simple
+User=nova
+EnvironmentFile=-/etc/nova/nova-novncproxy
+ExecStart=/usr/local/bin/nova-novncproxy --web /usr/share/novnc/ $OPTIONS
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "# start nova controller services"
+for i in {'nova-api','nova-consoleauth','nova-scheduler','nova-conductor','nova-novncproxy'}
+do
+    systemctl enable $i.service
+    systemctl start $i.service
+done
+
+echo "Controller:Nova Installation Completed."
+echo "#################################################################"
+echo "### Neutron Install"
+
+echo "# Edit Kernel Parameter"
+sed -i "s/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/" /etc/sysctl.conf
+sed -i "s/#net.ipv4.conf.all.rp_filter=1/net.ipv4.conf.all.rp_filter=0/" /etc/sysctl.conf
+sed -i "s/#net.ipv4.conf.default.rp_filter=1/net.ipv4.conf.default.rp_filter=0/" /etc/sysctl.conf
+
+echo "# Install Neutron"
+cd /opt/stack
+git clone http://git.openstack.org/openstack/neutron.git -b stable/mitaka
+cd neutron
+sudo pip install -e .
+
+echo "# neutron Configuration"
+cd /opt/stack/neutron
+tox -e genconfig
+
+mkdir -p /var/log/neutron /etc/neutron/plugins/ml2 /var/lib/neutron /var/run/neutron
+chown -R neutron:neutron /var/log/neutron
+cd /opt/stack/neutron/etc
+cp *.ini *.conf *.json /etc/neutron/.
+cp -R /opt/stack/neutron/etc/neutron/rootwrap.d /etc/neutron/.
+cp /opt/stack/neutron/etc/neutron.conf.sample /etc/neutron/.
+cp /opt/stack/neutron/etc/neutron/plugins/ml2/ml2_conf.ini.sample /etc/neutron/plugins/ml2/.
+cp /opt/stack/neutron/etc/metadata_agent.ini.sample /etc/neutron/.
+cp /opt/stack/neutron/etc/neutron/plugins/ml2/openvswitch_agent.ini.sample /etc/neutron/plugins/ml2/.
+cp /opt/stack/neutron/etc/l3_agent.ini.sample /etc/neutron/.
+cp /opt/stack/neutron/etc/dhcp_agent.ini.sample /etc/neutron/.
+
+echo "# configure neutron.conf"
+cat > /etc/neutron/neutron.conf << EOF
+[DEFAULT]
+verbose = true
+core_plugin = ml2
+service_plugins = router
+allow_overlapping_ips = true
+rpc_backend = rabbit
+auth_strategy = keystone
+state_path = /var/lib/neutron
+log_dir = /var/log/neutron
+
+notify_nova_on_port_status_changes = True
+notify_nova_on_port_data_changes = True
+
+[agent]
+root_helper = sudo /usr/local/bin/neutron-rootwrap /etc/neutron/rootwrap.conf
+
+[database]
+connection = mysql+pymysql://neutron:$SERVICE_PASS@$HOSTNAME/neutron
+
+[oslo_messaging_rabbit]
+rabbit_host = $HOSTNAME
+rabbit_userid = openstack
+rabbit_password = $RABBIT_PASS
+
+[oslo_concurrency]
+lock_path = /var/lib/neutron/lock
+
+[keystone_authtoken]
+auth_uri = http://$HOSTNAME:5000
+auth_url = http://$HOSTNAME:35357
+memcached_servers = $HOSTNAME:11211
+auth_type = password
+project_domain_name = default
+user_domain_name = default
+project_name = service
+username = neutron
+password = $SERVICE_PASS
+
+[nova]
+auth_url = http://$HOSTNAME:35357
+auth_type = password
+project_domain_name = default
+user_domain_name = default
+region_name = RegionOne
+project_name = service
+username = nova
+password = $SERVICE_PASS
+EOF
+
+echo "# Configure ml2_conf.ini"
+cat > /etc/neutron/plugins/ml2/ml2_conf.ini << EOF
+[ml2]
+type_drivers = flat,vlan,vxlan
+tenant_network_types = vxlan
+mechanism_drivers = openvswitch,l2population
+extension_drivers = port_security
+
+[ml2_type_flat]
+flat_networks = external
+
+[ml2_type_vxlan]
+vni_ranges = 65537:69999
+
+[securitygroup]
+firewall_driver = iptables_hybrid
+enable_security_group = true
+enable_ipset = true
+EOF
+
+echo "# Configure openvswitch agent"
+cat > /etc/neutron/plugins/ml2/openvswitch_agent.ini << EOF
+[DEFAULT]
+verbose = true
+debug = true
+log_dir = /var/log/neutron
+
+[ovs]
+local_ip = $TUNNEL_IP
+integration_bridge = br-int
+bridge_mappings = external:br-ex
+datapath_type = system
+tunnel_bridge = br-tun
+
+[agent]
+tunnel_types = vxlan
+l2_population = true
+
+[securitygroup]
+firewall_driver = iptables_hybrid
+enable_security_group = true
+enable_ipset = true
+EOF
+
+echo "# Configure l3_agent"
+cat > /etc/neutron/l3_agent.ini << EOF
+[DEFAULT]
+verbose = true
+interface_driver = neutron.agent.linux.interface.OVSInterfaceDriver
+external_network_bridge =
+router_delete_namespaces = true
+EOF
+
+echo "# Configure dhcp_agent"
+cat > /etc/neutron/dhcp_agent.ini << EOF
+[DEFAULT]
+verbose = true
+interface_driver = neutron.agent.linux.interface.OVSInterfaceDriver
+dhcp_driver = neutron.agent.linux.dhcp.Dnsmasq
+enable_isolated_metadata = True
+EOF
+
+echo "# Configure metadata agent"
+cat > /etc/neutron/metadata_agent.ini << EOF
+[DEFAULT]
+verbose = true
+nova_metadata_ip = $HOSTNAME
+metadata_proxy_shared_secret = $SERVICE_PASS
+EOF
+
+echo "# chown neutron diretories"
+chown -R neutron.neutron /etc/neutron
+chown root:root /etc/neutron/rootwrap.conf
+chown -R root:root /etc/neutron/rootwrap.d
+chown neutron:neutron /var/lib/neutron
+chown neutron:neutron /var/run/neutron
+
+echo "# Create neutron DB"
+su -s /bin/sh -c "neutron-db-manage --config-file /etc/neutron/neutron.conf --config-file /etc/neutron/plugins/ml2/ml2_conf.ini upgrade head" neutron
+
+echo "# create neutron-server init script"
+cat > /lib/systemd/system/neutron-server.service << EOF
+[Unit]
+Description=OpenStack Neutron Server
+After=syslog.target network.target
+[Service]
+Type=notify
+User=neutron
+ExecStart=/usr/local/bin/neutron-server --config-file /etc/neutron/neutron.conf \
+                 --config-file /etc/neutron/plugins/ml2/ml2_conf.ini \
+                 --log-file /var/log/neutron/neutron-server.log
+PrivateTmp=true
+NotifyAccess=all
+KillMode=process
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "# Create neutron-metadata-agent init script"
+cat > /lib/systemd/system/neutron-metadata-agent.service << EOF
+[Unit]
+Description=OpenStack Neutron Metadata Agent
+After=syslog.target network.target
+[Service]
+Type=simple
+User=neutron
+ExecStart=/usr/local/bin/neutron-metadata-agent --config-file /etc/neutron/neutron.conf --config-file /etc/neutron/metadata_agent.ini --log-file /var/log/neutron/neutron-metadata-agent.log
+PrivateTmp=false
+KillMode=process
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "# Create neutron-openvswitch-agent init script"
+cat > /lib/systemd/system/neutron-openvswitch-agent.service << EOF
+[Unit]
+Description=OpenStack Neutron Open vSwitch Agent
+After=syslog.target network.target network.service
+PartOf=network.service
+[Service]
+Type=simple
+User=neutron
+ExecStart=/usr/local/bin/neutron-openvswitch-agent \
+                 --config-file /etc/neutron/neutron.conf \
+                 --config-file /etc/neutron/plugins/ml2/ml2_conf.ini \
+                 --config-file /etc/neutron/plugins/ml2/openvswitch_agent.ini \
+                 --log-file /var/log/neutron/neutron-openvswitch-agent.log
+PrivateTmp=true
+KillMode=process
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /lib/systemd/system/neutron-dhcp-agent.service << EOF
+[Unit]
+Description=OpenStack Neutron DHCP Agent
+After=syslog.target network.target
+[Service]
+Type=simple
+User=neutron
+ExecStart=/usr/local/bin/neutron-dhcp-agent \
+                  --config-file /etc/neutron/neutron.conf \
+                  --config-file /etc/neutron/dhcp_agent.ini \
+                  --log-file /var/log/neutron/neutron-dhcp-agent.log
+PrivateTmp=false
+KillMode=process
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /lib/systemd/system/neutron-l3-agent.service << EOF
+[Unit]
+Description=OpenStack Neutron Layer 3 Agent
+After=syslog.target network.target
+[Service]
+Type=simple
+User=neutron
+ExecStart=/usr/local/bin/neutron-l3-agent \
+                  --config-file /etc/neutron/neutron.conf \
+                  --config-file /etc/neutron/l3_agent.ini \
+                  --log-file /var/log/neutron/neutron-l3-agent.log
+PrivateTmp=false
+KillMode=process
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "# br-ex create"
+ovs-vsctl restart openvswitch-switch.service
+ovs-vsctl --no-wait -- --may-exist add-br br-ex
+#ovs-vsctl br-set-external-id br-ex bridge-id br-ex
+#ip link set br-ex up
+#ip addr add 192.168.30.26/24 dev br-ex
+#route add -net 0.0.0.0/0 gw 192.168.30.1 dev br-ex
+ovs-vsctl --may-exist add-port br-ex $EXTERNAL_INTERFACE
+#ip addr del 192.168.30.26/24 dev enp0s10
+#ovs-vsctl set Bridge br-ex other_config:disable-in-band=true
+
+echo "# start neutron services"
+for i in {'neutron-server','neutron-metadata-agent','neutron-openvswitch-agent','neutron-dhcp-agent','neutron-l3-agent'}
+do
+    systemctl enable $i.service
+    systemctl restart $i.service
+done
+
+echo "### Controller:Neutron Installation Completed. ###"
+echo "#################################################################"
+echo "### Horizon Install ###"
+echo "# Install Horizon"
+cd /opt/stack
+git clone http://git.openstack.org/openstack/horizon.git -b stable/mitaka
+cd /opt/stack/horizon
+sudo pip install -e .
+
+echo "# Configure local_settings.py"
+cd openstack_dashboard/local/
+cat > local_settings.py << EOF
+
+# -*- coding: utf-8 -*-
+
+import os
+
+from django.utils.translation import ugettext_lazy as _
+
+from horizon.utils import secret_key
+
+from openstack_dashboard import exceptions
+from openstack_dashboard.settings import HORIZON_CONFIG
+
+DEBUG = True
+TEMPLATE_DEBUG = DEBUG
+
+
+#WEBROOT = '/'
+ALLOWED_HOSTS = ['*', ]
+
+OPENSTACK_API_VERSIONS = {
+    "data-processing": 1.1,
+    "identity": 3,
+    "volume": 2,
+    "compute": 2,
+}
+
+OPENSTACK_KEYSTONE_MULTIDOMAIN_SUPPORT = True
+OPENSTACK_KEYSTONE_DEFAULT_DOMAIN = 'default'
+
+LOCAL_PATH = os.path.dirname(os.path.abspath(__file__))
+
+SECRET_KEY = secret_key.generate_or_read_from_file(
+    os.path.join(LOCAL_PATH, '.secret_key_store'))
+
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.memcached.MemcachedCache',
+        'LOCATION': '$HOSTNAME:11211',
+    },
+}
+
+EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+
+WEBROOT="/dashboard/"
+COMPRESS_OFFLINE=True
+OPENSTACK_HOST = "$HOSTNAME"
+OPENSTACK_KEYSTONE_URL = "http://%s:5000/v3" % OPENSTACK_HOST
+OPENSTACK_KEYSTONE_DEFAULT_ROLE = "user"
+
+OPENSTACK_KEYSTONE_BACKEND = {
+    'name': 'native',
+    'can_edit_user': True,
+    'can_edit_group': True,
+    'can_edit_project': True,
+    'can_edit_domain': True,
+    'can_edit_role': True,
+}
+
+OPENSTACK_HYPERVISOR_FEATURES = {
+    'can_set_mount_point': False,
+    'can_set_password': False,
+    'requires_keypair': False,
+}
+
+OPENSTACK_CINDER_FEATURES = {
+    'enable_backup': False,
+}
+
+OPENSTACK_NEUTRON_NETWORK = {
+    'enable_router': True,
+    'enable_quotas': True,
+    'enable_ipv6': True,
+    'enable_distributed_router': False,
+    'enable_ha_router': False,
+    'enable_lb': True,
+    'enable_firewall': True,
+    'enable_vpn': True,
+    'enable_fip_topology_check': True,
+    'default_ipv4_subnet_pool_label': None,
+    'default_ipv6_subnet_pool_label': None,
+    'profile_support': None,
+    'supported_provider_types': ['*'],
+    'supported_vnic_types': ['*'],
+}
+
+OPENSTACK_HEAT_STACK = {
+    'enable_user_pass': True,
+}
+
+IMAGE_CUSTOM_PROPERTY_TITLES = {
+    "architecture": _("Architecture"),
+    "kernel_id": _("Kernel ID"),
+    "ramdisk_id": _("Ramdisk ID"),
+    "image_state": _("Euca2ools state"),
+    "project_id": _("Project ID"),
+    "image_type": _("Image Type"),
+}
+
+IMAGE_RESERVED_CUSTOM_PROPERTIES = []
+
+API_RESULT_LIMIT = 1000
+API_RESULT_PAGE_SIZE = 20
+SWIFT_FILE_TRANSFER_CHUNK_SIZE = 512 * 1024
+DROPDOWN_MAX_ITEMS = 30
+TIME_ZONE = "Asia/Seoul"
+
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'null': {
+            'level': 'DEBUG',
+            'class': 'logging.NullHandler',
+        },
+        'console': {
+            # Set the level to "DEBUG" for verbose output logging.
+            'level': 'INFO',
+            'class': 'logging.StreamHandler',
+        },
+    },
+    'loggers': {
+        # Logging from django.db.backends is VERY verbose, send to null
+        # by default.
+        'django.db.backends': {
+            'handlers': ['null'],
+            'propagate': False,
+        },
+        'requests': {
+            'handlers': ['null'],
+            'propagate': False,
+        },
+        'horizon': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'openstack_dashboard': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'novaclient': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'cinderclient': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'keystoneclient': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'glanceclient': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'neutronclient': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'heatclient': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'ceilometerclient': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'swiftclient': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'openstack_auth': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'nose.plugins.manager': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'django': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'iso8601': {
+            'handlers': ['null'],
+            'propagate': False,
+        },
+        'scss': {
+            'handlers': ['null'],
+            'propagate': False,
+        },
+    },
+}
+
+SECURITY_GROUP_RULES = {
+    'all_tcp': {
+        'name': _('All TCP'),
+        'ip_protocol': 'tcp',
+        'from_port': '1',
+        'to_port': '65535',
+    },
+    'all_udp': {
+        'name': _('All UDP'),
+        'ip_protocol': 'udp',
+        'from_port': '1',
+        'to_port': '65535',
+    },
+    'all_icmp': {
+        'name': _('All ICMP'),
+        'ip_protocol': 'icmp',
+        'from_port': '-1',
+        'to_port': '-1',
+    },
+    'ssh': {
+        'name': 'SSH',
+        'ip_protocol': 'tcp',
+        'from_port': '22',
+        'to_port': '22',
+    },
+    'smtp': {
+        'name': 'SMTP',
+        'ip_protocol': 'tcp',
+        'from_port': '25',
+        'to_port': '25',
+    },
+    'dns': {
+        'name': 'DNS',
+        'ip_protocol': 'tcp',
+        'from_port': '53',
+        'to_port': '53',
+    },
+    'http': {
+        'name': 'HTTP',
+        'ip_protocol': 'tcp',
+        'from_port': '80',
+        'to_port': '80',
+    },
+    'pop3': {
+        'name': 'POP3',
+        'ip_protocol': 'tcp',
+        'from_port': '110',
+        'to_port': '110',
+    },
+    'imap': {
+        'name': 'IMAP',
+        'ip_protocol': 'tcp',
+        'from_port': '143',
+        'to_port': '143',
+    },
+    'ldap': {
+        'name': 'LDAP',
+        'ip_protocol': 'tcp',
+        'from_port': '389',
+        'to_port': '389',
+    },
+    'https': {
+        'name': 'HTTPS',
+        'ip_protocol': 'tcp',
+        'from_port': '443',
+        'to_port': '443',
+    },
+    'smtps': {
+        'name': 'SMTPS',
+        'ip_protocol': 'tcp',
+        'from_port': '465',
+        'to_port': '465',
+    },
+    'imaps': {
+        'name': 'IMAPS',
+        'ip_protocol': 'tcp',
+        'from_port': '993',
+        'to_port': '993',
+    },
+    'pop3s': {
+        'name': 'POP3S',
+        'ip_protocol': 'tcp',
+        'from_port': '995',
+        'to_port': '995',
+    },
+    'ms_sql': {
+        'name': 'MS SQL',
+        'ip_protocol': 'tcp',
+        'from_port': '1433',
+        'to_port': '1433',
+    },
+    'mysql': {
+        'name': 'MYSQL',
+        'ip_protocol': 'tcp',
+        'from_port': '3306',
+        'to_port': '3306',
+    },
+    'rdp': {
+        'name': 'RDP',
+        'ip_protocol': 'tcp',
+        'from_port': '3389',
+        'to_port': '3389',
+    },
+}
+
+REST_API_REQUIRED_SETTINGS = ['OPENSTACK_HYPERVISOR_FEATURES',
+                              'LAUNCH_INSTANCE_DEFAULTS']
+EOF
+
+
+echo "# UI Configuration"
+cd /opt/stack
+git clone https://github.com/eternicode/bootstrap-datepicker.git
+mkdir -p /opt/stack/horizon/static/horizon/lib/bootstrap_datepicker
+cp -R bootstrap-datepicker/js/locales/ /opt/stack/horizon/static/horizon/lib/bootstrap_datepicker/.
+git clone https://github.com/FortAwesome/Font-Awesome.git
+mkdir -p /opt/stack/horizon/static/horizon/lib/font-awesome
+cp -R Font-Awesome/fonts/ /opt/stack/horizon/static/horizon/lib/font-awesome/.
+mkdir -p /opt/stack/horizon/static/framework/widgets/toast
+cp /opt/stack/horizon/horizon/static/framework/widgets/toast/toast.html /opt/stack/horizon/static/framework/widgets/toast/toast.html
+mkdir -p /opt/stack/horizon/static/dashboard/img/
+cp /opt/stack/horizon/openstack_dashboard/static/dashboard/img/* /opt/stack/horizon/static/dashboard/img/.
+
+echo "# Django Compress"
+cd /opt/stack/horizon
+django-admin compress --force
+
+echo "# Create apache horizon module"
+cat > /etc/apache2/sites-available/horizon.conf << EOF
+<VirtualHost *:80>
+    WSGIScriptAlias /dashboard /opt/stack/horizon/openstack_dashboard/wsgi/django.wsgi
+    WSGIDaemonProcess horizon user=stack group=stack processes=3 threads=10 home=/opt/stack/horizon display-name=%{GROUP}
+    WSGIApplicationGroup %{GLOBAL}
+    SetEnv APACHE_RUN_USER stack
+    SetEnv APACHE_RUN_GROUP stack
+    WSGIProcessGroup horizon
+    DocumentRoot /opt/stack/horizon/.blackhole/
+    Alias /dashboard/media /opt/stack/horizon/openstack_dashboard/static
+    Alias /dashboard/static /opt/stack/horizon/static
+    RedirectMatch "^/$" "/dashboard/"
+    <Directory />
+        Options FollowSymLinks
+        AllowOverride None
+    </Directory>
+    <Directory /opt/stack/horizon/>
+        Options Indexes FollowSymLinks MultiViews
+        AllowOverride None
+        # Apache 2.4 uses mod_authz_host for access control now (instead of
+        #  "Allow")
+        <IfVersion < 2.4>
+            Order allow,deny
+            Allow from all
+        </IfVersion>
+        <IfVersion >= 2.4>
+            Require all granted
+        </IfVersion>
+    </Directory>
+    <IfVersion >= 2.4>
+      ErrorLogFormat "%{cu}t %M"
+    </IfVersion>
+    ErrorLog /var/log/apache2/horizon_error.log
+    LogLevel warn
+    CustomLog /var/log/apache2/horizon_access.log combined
+</VirtualHost>
+WSGISocketPrefix /var/run/apache2
+EOF
+
+echo "# Enable horizon module"
+cd /etc/apache2/sites-enabled
+rm 000-default.conf
+ln -s ../sites-available/horizon.conf horizon.conf
+#chown -R stack /var/lib/openstack-dashboard/
+chown -R stack /opt/stack/horizon/openstack_dashboard/local/
+
+echo "# Restart apache service"
+systemctl restart apache2.service
+
+echo "Controller:Horizon Installation Completed."
+echo "#################################################################"
+echo "### Cinder Install ###"
+
+echo "# Install ceph-common"
+sudo apt -y install ceph-common
+
+echo "# Install Cinder Cient"
+cd /opt/stack
+git clone $GIT_URL/python-cinderclient.git
+cd python-cinderclient
+sudo pip install -e .
+
+echo "# Install Cinder"
+cd /opt/stack
+git clone $GIT_URL/cinder.git
+cd cinder
+sudo pip install -e .
+
+echo "# Generate cinder.conf"
+cd /opt/stack/cinder
+tox -egenconfig
+
+echo "# Configure Cinder"
+mkdir -p /etc/cinder /var/log/cinder /var/lib/cinder/volumes /var/lib/cinder/tmp /var/run/cinder
+cd /opt/stack/cinder/etc/cinder
+cp -R *.conf *.json *.ini rootwrap.d /etc/cinder/.
+
+echo "# Create cinder.conf"
+cat > /etc/cinder/cinder.conf << EOF
+[DEFAULT]
+rootwrap_config = /etc/cinder/rootwrap.conf
+api_paste_confg = /etc/cinder/api-paste.ini
+verbose = True
+debug = True
+auth_strategy = keystone
+state_path = /var/lib/cinder
+lock_path = /var/lock/cinder
+volumes_dir = /var/lib/cinder/volumes
+rpc_backend = rabbit
+auth_strategy = keystone
+my_ip = $MGMT_IP
+glance_api_servers = http://$HOSTNAME:9292
+glance_api_version = 2
+
+nova_endpoint_template = http://$HOSTNAME:8774/v2.1/%(project_id)s
+#os_privileged_user_name = nova
+scheduler_driver = cinder.scheduler.filter_scheduler.FilterScheduler
+scheduler_default_filters = AvailabilityZoneFilter,CapacityFilter,CapabilitiesFilter
+
+storage_availability_zone=nova
+
+enabled_backends = ceph
+
+[ceph]
+volume_driver = cinder.volume.drivers.rbd.RBDDriver
+rbd_pool = volumes
+rbd_ceph_conf = /etc/ceph/ceph.conf
+rbd_flatten_volume_from_snapshot = false
+rbd_max_clone_depth = 5
+rbd_store_chunk_size = 4
+rados_connect_timeout = -1
+glance_api_version = 2
+rbd_user = cinder
+rbd_secret_uuid = 457eb676-33da-42ec-9a8c-9293d545c337
+
+[oslo_messaging_rabbit]
+rabbit_host = $HOSTNAME
+rabbit_userid = openstack
+rabbit_password = $RABBIT_PASS
+
+[oslo_concurrency]
+lock_path = /var/lib/cinder/tmp
+
+[database]
+connection = mysql+pymysql://cinder:$SERVICE_PASS@$HOSTNAME/cinder
+
+[keystone_authtoken]
+auth_uri = http://$HOSTNAME:5000
+auth_url = http://$HOSTNAME:35357
+memcached_servers = $HOSTNAME:11211
+auth_type = password
+project_domain_name = default
+user_domain_name = default
+project_name = service
+username = cinder
+password = $SERVICE_PASS
+EOF
+
+echo "# auth cinder directories"
+chown -R cinder:cinder /etc/cinder
+chown root:root /etc/cinder/rootwrap.conf
+chown -R root:root /etc/cinder/rootwrap.d
+chown -R cinder:cinder /var/log/cinder
+chown -R cinder:cinder /var/lib/cinder
+chown cinder:cinder /var/run/cinder
+
+echo "# cinder db sync"
+su -s /bin/sh -c "cinder-manage db sync" cinder
+
+echo "# create cinder-api init script"
+cat > /lib/systemd/system/cinder-api.service << EOF
+[Unit]
+Description=OpenStack Cinder API Server
+After=syslog.target network.target
+[Service]
+Type=simple
+User=cinder
+ExecStart=/usr/local/bin/cinder-api \
+--config-file /etc/cinder/cinder.conf --logfile /var/log/cinder/cinder-api.log
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "# create cinder-scheduler init script"
+cat > /lib/systemd/system/cinder-scheduler.service << EOF
+[Unit]
+Description=OpenStack Cinder Scheduler Server
+After=syslog.target network.target
+[Service]
+Type=simple
+User=cinder
+ExecStart=/usr/local/bin/cinder-scheduler \
+--config-file /etc/cinder/cinder.conf --logfile /var/log/cinder/cinder-scheduler.log
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "# create cinder-volume init script"
+cat > /lib/systemd/system/cinder-volume.service << EOF
+[Unit]
+Description=OpenStack Cinder Volume Server
+After=syslog.target network.target
+[Service]
+Type=simple
+User=cinder
+ExecStart=/usr/local/bin/cinder-volume \
+--config-file /etc/cinder/cinder.conf --logfile /var/log/cinder/cinder-volume.log
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "# Start Cinder Services"
+for i in {'cinder-api','cinder-scheduler','cinder-volume'}
+do
+    systemctl enable $i.service
+    systemctl start $i.service
+done
+
+echo "### Controller Installation Completed.###"
+echo "############################################################"
