@@ -12,8 +12,8 @@ OpenStack Source INSTALL Features
 Component Diagram
 =================
 .. image:: dev-arch.png
-   :height: 100px
-   :width: 200 px
+   :height: 70px
+   :width: 90 px
    :scale: 50 %
 
 =============
@@ -41,10 +41,10 @@ INSTALL GUIDE
 
     ## source this file in controller
     export MGMT_HOSTNAME="dev-controller"
-    export MGMT_IP="192.168.99.100"
+    export MGMT_IP="192.168.99.200"
     export CEPH_HOSTNAME="dev-ceph01"
     export HOSTNAME=`hostname -s`
-    export MY_IP="192.168.99.200"
+    export MY_IP="192.168.99.202"
     export TUNNEL_IP="192.168.56.202"
 
     export MYSQL_PASS="password"
